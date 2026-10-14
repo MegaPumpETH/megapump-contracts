@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import "forge-std/Script.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import "../src/MegaPumpFactory.sol";
+import "../src/MegaPumpLens.sol";
 import "../src/MegaPumpAddresses.sol";
 
 
@@ -56,6 +57,9 @@ contract DeployMegaPump is Script {
 
         IDexFactory(cfg.dexFactory).setPairCreator(address(proxy));
 
+        // Read-only views (estimates, getTokenInfo) live in the Lens.
+        MegaPumpLens lens = new MegaPumpLens(address(proxy));
+
         vm.stopBroadcast();
 
         require(
@@ -69,6 +73,7 @@ contract DeployMegaPump is Script {
         console.log("==============================================");
         console.log("PROXY (permanent address) :", address(proxy));
         console.log("Implementation v1          :", address(implementation));
+        console.log("Lens (read-only views)     :", address(lens));
         console.log("Owner                      :", factory.owner());
         console.log("Router (DEX V2)            :", factory.router());
         console.log("WETH                       :", factory.weth());

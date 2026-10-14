@@ -32,7 +32,7 @@ contract CreateAndBuyForCreatorTest is Helpers {
         assertEq(id, 1);
         assertEq(factory.tokenCount(), 1);
 
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
         assertTrue(info.deployed, "ERC20 deployed");
         assertEq(info.creator, alice);
         assertGt(_balanceOf(id, alice), 0, "creator received tokens");
@@ -67,7 +67,7 @@ contract CreateAndBuyForCreatorTest is Helpers {
             0, referrer, refSig
         );
 
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
         assertTrue(info.deployed);
 
         uint256 refBps = factory.referrerFeeBps();

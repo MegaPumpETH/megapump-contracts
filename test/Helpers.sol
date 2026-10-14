@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "../src/MegaPumpFactory.sol";
+import "../src/MegaPumpLens.sol";
 import "../src/MegaPumpToken.sol";
 import "../src/GraduationLib.sol";
 
@@ -46,6 +47,7 @@ contract MockV2Router {
     uint256 public lastAmountToken;
     uint256 public lastAmountETH;
     uint256 public lastLiquidity;
+    address public lastQuote;      // v3: ERC-20 quote of the last addLiquidity
     mapping(address => address) public pairOf;
 
 
@@ -74,6 +76,29 @@ contract MockV2Router {
         pairOf[token]   = address(uint160(uint256(keccak256(abi.encodePacked(token, "pair")))));
         amountToken     = amountTokenDesired;
         amountETH       = msg.value;
+    }
+
+    /// @dev v3: graduation of a token quoted in an ERC-20 (token/quote pool).
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 /*amountAMin*/,
+        uint256 /*amountBMin*/,
+        address to,
+        uint256 /*deadline*/
+    ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity) {
+        IERC20(tokenA).transferFrom(msg.sender, address(this), amountADesired);
+        IERC20(tokenB).transferFrom(msg.sender, address(this), amountBDesired);
+        lastTo          = to;
+        lastAmountToken = amountADesired;
+        lastAmountETH   = amountBDesired;   // quote amount
+        lastQuote       = tokenB;
+        liquidity       = amountADesired;
+        lastLiquidity   = liquidity;
+        amountA         = amountADesired;
+        amountB         = amountBDesired;
     }
 
     function createPair(address tokenA, address tokenB) external returns (address pair) {
@@ -111,6 +136,7 @@ contract MockV2Pair {
 
 abstract contract Helpers is Test {
     MegaPumpFactory public factory;
+    MegaPumpLens public lens;
     MockWETH public weth;
     MockV2Router public router;
 
@@ -159,6 +185,7 @@ abstract contract Helpers is Test {
         );
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
         factory = MegaPumpFactory(payable(address(proxy)));
+        lens = new MegaPumpLens(address(factory));
 
         // Set trusted signer + disable cooldown for simpler tests
         factory.setSigner(signer);
@@ -349,6 +376,8 @@ abstract contract Helpers is Test {
     /// @notice Low-level: sign + call createAndBuyForCreator. No anti-snipe skip.
     ///         Uses nonce=0 for simplicity — tests don't need to vary the nonce
     ///         since each call uses a different (name, ticker, metadataURI) tuple.
+    ///         Required since M1: the contract consumes a signature passed on
+    ///         the self-create path, so the same creator can't reuse one tuple.
     function _createTokenWithBuy(
         address creator,
         string memory name,
@@ -438,8 +467,8 @@ abstract contract Helpers is Test {
     //  TOKEN DATA ACCESSORS
     // ════════════════════════════════════════════════════════════
 
-    function _info(uint256 id) internal view returns (MegaPumpFactory.TokenInfo memory) {
-        return factory.getTokenInfo(id);
+    function _info(uint256 id) internal view returns (MegaPumpLens.TokenInfo memory) {
+        return lens.getTokenInfo(id);
     }
 
     function _tokenAddr(uint256 id) internal view returns (address) {
@@ -463,7 +492,7 @@ abstract contract Helpers is Test {
     }
 
     function _snapshot(uint256 id, address buyer, address referrer) internal view returns (EthSnapshot memory s) {
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
         s.totalRaised   = info.totalRaised;
         s.platformFees  = factory.platformFeesAccrued();
         s.creatorFees   = info.creatorFees;

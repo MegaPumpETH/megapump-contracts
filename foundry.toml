@@ -6,9 +6,15 @@ solc    = "0.8.24"
 optimizer       = true
 optimizer_runs  = 200
 via_ir          = true
+# Read-only access for the tests that load reference bytecode (v1 implementation, DEX contracts)
+fs_permissions  = [{ access = "read", path = "./test/fixtures" }]
 
 [profile.default.fuzz]
 runs = 10000
+
+# CI (FOUNDRY_PROFILE=ci): same compiler settings, fewer fuzz runs
+[profile.ci.fuzz]
+runs = 1000
 
 [rpc_endpoints]
 # Testnet (Chain ID: 6343) — public endpoint, rate limited

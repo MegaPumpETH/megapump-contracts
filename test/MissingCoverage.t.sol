@@ -327,7 +327,7 @@ contract MissingCoverageTest is Helpers {
         assertTrue(_info(id).graduated, "graduated");
 
         // estimateSell on graduated: documented, non-binding behavior
-        try factory.estimateSell(id, 1_000_000 ether, bob) returns (uint256 out) {
+        try lens.estimateSell(id, 1_000_000 ether, bob) returns (uint256 out) {
             emit log_named_uint("estimateSell on graduated (informative)", out);
         } catch {
             emit log("estimateSell reverts on graduated (acceptable)");

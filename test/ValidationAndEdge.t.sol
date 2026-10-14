@@ -296,16 +296,16 @@ contract ValidationAndEdgeTest is Helpers {
         uint256 idB = _createTokenCustom(bob,     "B", "BB", "", 2 ether);
         uint256 idC = _createTokenCustom(charlie, "C", "CC", "", 0.5 ether);
 
-        MegaPumpFactory.TokenInfo memory infoA_before = _info(idA);
-        MegaPumpFactory.TokenInfo memory infoC_before = _info(idC);
+        MegaPumpLens.TokenInfo memory infoA_before = _info(idA);
+        MegaPumpLens.TokenInfo memory infoC_before = _info(idC);
 
         _buy(idB, charlie, 5 ether);
         _buy(idB, alice, 3 ether);
         uint256 charlieB = _balanceOf(idB, charlie);
         _sell(idB, charlie, charlieB / 2);
 
-        MegaPumpFactory.TokenInfo memory infoA_after = _info(idA);
-        MegaPumpFactory.TokenInfo memory infoC_after = _info(idC);
+        MegaPumpLens.TokenInfo memory infoA_after = _info(idA);
+        MegaPumpLens.TokenInfo memory infoC_after = _info(idC);
 
         assertEq(infoA_after.totalRaised,  infoA_before.totalRaised);
         assertEq(infoA_after.tokensSold,   infoA_before.tokensSold);
@@ -369,7 +369,7 @@ contract ValidationAndEdgeTest is Helpers {
     function test_SmallAmounts_TinyButValidBuy() public {
         uint256 id = _createAndDeploy(alice, 1 ether);
 
-        uint256 estimated = factory.estimateBuy(id, 10000, bob);
+        uint256 estimated = lens.estimateBuy(id, 10000, bob);
 
         if (estimated == 0) {
             vm.prank(bob);

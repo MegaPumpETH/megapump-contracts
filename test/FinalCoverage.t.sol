@@ -460,7 +460,9 @@ contract FinalCoverageTest is Helpers {
     function test_ClaimAllCreatorFees_MaxBatch_GasMeasured() public {
         uint256[] memory ids = new uint256[](100);
         for (uint256 i = 0; i < 100; i++) {
-            uint256 id = _createTokenCustom(alice, "G", "GG", "", 0.01 ether);
+            // Distinct URI per token: the self-create signature is consumed (M1),
+            // the same signed fields can't launch twice.
+            uint256 id = _createTokenCustom(alice, "G", "GG", string.concat("ipfs://g", vm.toString(i)), 0.01 ether);
             _buy(id, bob, 0.5 ether); // real third-party buy → real creator fees
             ids[i] = id;
             vm.roll(block.number + 1); // spread out, avoids cooldown/anti-snipe interference

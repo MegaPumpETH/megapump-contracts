@@ -300,7 +300,7 @@ contract GaslessCreationTest is Helpers {
             0, address(0), ""
         );
 
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
 
         // ── Creator is alice (NOT bob) ──
         assertEq(info.creator, alice, "alice is creator");
@@ -339,7 +339,7 @@ contract GaslessCreationTest is Helpers {
             0, ref, refSig
         );
 
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
 
         assertEq(info.creator, alice);
         assertGt(_balanceOf(id, bob), 0);
@@ -362,7 +362,7 @@ contract GaslessCreationTest is Helpers {
             0, address(0), ""
         );
 
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
         assertEq(info.creator, alice, "alice creator");
         assertGt(_balanceOf(id, alice), 0, "alice received tokens (she's the buyer)");
         // Creator buying her own token → NO creator fee
@@ -522,7 +522,7 @@ contract GaslessCreationTest is Helpers {
         vm.prank(bob);
         factory.buy{value: 5 ether}(id, 0, alice, refSig);
 
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
 
         uint256 creatorFeesDelta = info.creatorFees - creatorFeesBefore;
         assertGt(creatorFeesDelta, 0, "creator fees accrued");
@@ -549,31 +549,41 @@ contract GaslessCreationTest is Helpers {
     //  SECTION 7 — UUPS UPGRADE PRESERVES GASLESS STATE
     // ════════════════════════════════════════════════════════════════
 
-    function test_Upgrade_PreservesUsedSignatures() public {
+    /// @notice Upgrade preserves the digest-keyed replay guard (v2 semantics).
+    function test_Upgrade_PreservesReplayGuard() public {
         bytes memory sig = _signCreateFor(alice, "Tok", "TK", "", type(uint256).max, 0);
         vm.prank(bob);
         factory.createAndBuyForCreator{value: 0.01 ether}(
-            alice, "Tok", "TK", "",
-            type(uint256).max,
-            0, sig,
-            0, address(0), ""
-        );
-        bytes32 sigHash = keccak256(sig);
-        assertTrue(factory.usedSignatures(sigHash), "sig marked used pre-upgrade");
+            alice, "Tok", "TK", "", type(uint256).max, 0, sig, 0, address(0), "");
+
+        bytes32 digest = _createDigest(alice, "Tok", "TK", "", type(uint256).max, 0);
+        assertTrue(factory.usedSignatures(digest), "intent marked pre-upgrade");
 
         MegaPumpFactory newImpl = new MegaPumpFactory();
         factory.upgradeToAndCall(address(newImpl), "");
 
-        assertTrue(factory.usedSignatures(sigHash), "sig STILL marked used post-upgrade");
+        assertTrue(factory.usedSignatures(digest), "intent STILL marked post-upgrade");
+        vm.prank(bob);
+        vm.expectRevert(SignatureAlreadyUsed.selector);
+        factory.createAndBuyForCreator{value: 0.01 ether}(
+            alice, "Tok", "TK", "", type(uint256).max, 0, sig, 0, address(0), "");
+    }
+
+    /// @notice v1→v2 migration guard: entries written by v1 under SIGHASH keys
+    ///         must still block replay in v2 (dual check sigHash || digest).
+    ///         Simulates a v1 entry via vm.store (v1 source no longer in repo).
+    function test_MigrationGuard_V1SigHashEntry_BlocksReplay() public {
+        bytes memory sig = _signCreateFor(alice, "Legacy", "LGC", "", type(uint256).max, 7);
+        bytes32 sigHash = keccak256(sig);
+
+        uint256 mappingSlot = 18; // ← à remplacer, voir étape 3
+        bytes32 entrySlot = keccak256(abi.encode(sigHash, bytes32(mappingSlot)));
+        vm.store(address(factory), entrySlot, bytes32(uint256(1)));
 
         vm.prank(bob);
         vm.expectRevert(SignatureAlreadyUsed.selector);
         factory.createAndBuyForCreator{value: 0.01 ether}(
-            alice, "Tok", "TK", "",
-            type(uint256).max,
-            0, sig,
-            0, address(0), ""
-        );
+            alice, "Legacy", "LGC", "", type(uint256).max, 7, sig, 0, address(0), "");
     }
 
     function test_Upgrade_PreservesCooldownState() public {
@@ -625,10 +635,10 @@ contract GaslessCreationTest is Helpers {
     ///         shows up in storage, and reading reflects the write.
     function test_StorageLayout_UsedSignaturesMappingIsLive() public {
         bytes memory sig = _signCreateFor(alice, "Tok", "TK", "", type(uint256).max, 0);
-        bytes32 sigHash = keccak256(sig);
+        bytes32 digest = _createDigest(alice, "Tok", "TK", "", type(uint256).max, 0);
 
         // Pre-consumption: must be false
-        assertFalse(factory.usedSignatures(sigHash), "starts false");
+        assertFalse(factory.usedSignatures(digest), "starts false");
 
         vm.prank(bob);
         factory.createAndBuyForCreator{value: 0.01 ether}(
@@ -639,12 +649,12 @@ contract GaslessCreationTest is Helpers {
         );
 
         // Post-consumption: must be true (via the public getter)
-        assertTrue(factory.usedSignatures(sigHash), "marked used after creation");
+        assertTrue(factory.usedSignatures(digest), "intent marked used after creation");
 
         // Find the actual storage slot by probing slots 0-30
         uint256 foundSlot = type(uint256).max;
         for (uint256 slot = 0; slot <= 30; slot++) {
-            bytes32 entrySlot = keccak256(abi.encode(sigHash, bytes32(slot)));
+            bytes32 entrySlot = keccak256(abi.encode(digest, bytes32(slot)));
             bytes32 raw = vm.load(address(factory), entrySlot);
             if (uint256(raw) == 1) {
                 foundSlot = slot;
@@ -800,8 +810,10 @@ contract GaslessCreationTest is Helpers {
         assertEq(_info(idB).creator, alice);
 
         // Sigs are different so both anti-replay slots are independent
-        assertTrue(factory.usedSignatures(keccak256(sigA)), "sigA marked used");
-        assertTrue(factory.usedSignatures(keccak256(sigB)), "sigB marked used");
+        bytes32 digestA = _createDigest(alice, "Twin", "TW", "ipfs://same", type(uint256).max, 1);
+        bytes32 digestB = _createDigest(alice, "Twin", "TW", "ipfs://same", type(uint256).max, 2);
+        assertTrue(factory.usedSignatures(digestA), "intent A marked used");
+        assertTrue(factory.usedSignatures(digestB), "intent B marked used");
     }
 
     /// @notice Tampering with the nonce (signing with N, calling with N+1)

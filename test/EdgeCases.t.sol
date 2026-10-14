@@ -98,7 +98,7 @@ contract EdgeCasesTest is Helpers {
 
         for (uint256 i = 0; i < 30; i++) {
             uint256 mid = (low + high) / 2;
-            uint256 estimate = factory.estimateBuy(id, mid, bob);
+            uint256 estimate = lens.estimateBuy(id, mid, bob);
             if (estimate <= antiMax) {
                 ethJustBelow = mid;
                 low = mid + 1;

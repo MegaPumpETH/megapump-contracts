@@ -130,7 +130,7 @@ contract FuzzAndInvariantsTest is Helpers {
     }
 
     function _checkLedgerInvariant(uint256 id) internal view {
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
         uint256 expected = info.totalRaised
             + factory.platformFeesAccrued()
             + info.creatorFees;

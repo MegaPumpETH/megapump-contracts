@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MegaPumpFactory} from "../src/MegaPumpFactory.sol";
+import {MockQuoteToken} from "./mocks/QuoteMocks.sol";
 
 // ──────────────────────────────────────────────────────────────────────────
 //  GRADUATION INTEGRATION TEST — MegaETH TESTNET FORK
@@ -58,6 +59,13 @@ contract GraduationForkTest is Test {
     address attacker = makeAddr("attacker");
 
     function setUp() public {
+        // No fork (plain `forge test`): the live DEX isn't there. Skip these
+        // tests instead of failing in setUp; run them with --fork-url.
+        if (DEX_FACTORY.code.length == 0) {
+            vm.skip(true);
+            return;
+        }
+
         // ── 1. Deploy the implementation + MegaPump proxy inside the fork ──
         MegaPumpFactory impl = new MegaPumpFactory();
         bytes memory initData = abi.encodeCall(
@@ -81,21 +89,21 @@ contract GraduationForkTest is Test {
         vm.deal(attacker, 10 ether);
     }
 
-    // ── Read helpers for the TokenData struct (14 fields) ──
+    // ── Read helpers for the TokenData struct (15 fields since v3) ──
     function _tokenAddr(uint256 id) internal view returns (address a) {
-        (, , , , , , a, , , , , , , ) = factory.tokenData(id);
+        (, , , , , , a, , , , , , , , ) = factory.tokenData(id);
     }
     function _graduated(uint256 id) internal view returns (bool g) {
-        (, , , , , , , , , , g, , , ) = factory.tokenData(id);
+        (, , , , , , , , , , g, , , , ) = factory.tokenData(id);
     }
     function _dexPool(uint256 id) internal view returns (address p) {
-        (, , , , , , , , , , , p, , ) = factory.tokenData(id);
+        (, , , , , , , , , , , p, , , ) = factory.tokenData(id);
     }
     function _totalRaised(uint256 id) internal view returns (uint256 r) {
-        (, , , , , , , r, , , , , , ) = factory.tokenData(id);
+        (, , , , , , , r, , , , , , , ) = factory.tokenData(id);
     }
     function _creatorFees(uint256 id) internal view returns (uint256 f) {
-        (, , , , , , , , , f, , , , ) = factory.tokenData(id);
+        (, , , , , , , , , f, , , , , ) = factory.tokenData(id);
     }
 
     function _createToken(uint256 firstBuyEth) internal returns (uint256 id, address tokenAddr) {
@@ -239,5 +247,62 @@ contract GraduationForkTest is Test {
             100,
             "ETH accounting broken after incremental graduation"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  TEST 5 — v3: a token quoted in an ERC-20 graduates into a token/quote
+    //  pair on the real DEX (addLiquidity), a pair only our proxy can create.
+    // ════════════════════════════════════════════════════════════════════
+    function test_QuoteGraduation() public {
+        MockQuoteToken usd = new MockQuoteToken("USD test", "USDt", 18);
+        factory.setQuote(address(usd), true, 1_000 ether, 10 ether);
+        usd.mint(creator, 10 ether);
+        usd.mint(buyer, 5_000 ether);
+        vm.prank(creator);
+        usd.approve(address(factory), type(uint256).max);
+        vm.prank(buyer);
+        usd.approve(address(factory), type(uint256).max);
+
+        vm.prank(creator);
+        uint256 id = factory.createAndBuyWithQuote(
+            creator, "QuoteCoin", "QTE", "ipfs://q", address(usd),
+            type(uint256).max, 0, "", 5 ether, 0, address(0), ""
+        );
+        address tokenAddr = _tokenAddr(id);
+        vm.roll(block.number + 6);
+
+        // Nobody else can open the token/quote pair before graduation
+        vm.prank(attacker);
+        vm.expectRevert(bytes("UniswapV2: FORBIDDEN_CREATE"));
+        dexFactory.createPair(tokenAddr, address(usd));
+
+        uint256 before = usd.balanceOf(buyer);
+        vm.prank(buyer);
+        factory.buyWithQuote(id, 2_000 ether, 0, address(0), "");
+
+        assertTrue(_graduated(id), "quote token should have graduated");
+        address pool = _dexPool(id);
+        assertEq(dexFactory.getPair(tokenAddr, address(usd)), pool, "dexPool != getPair(token, quote)");
+        assertEq(dexFactory.getPair(tokenAddr, WETH), address(0), "no WETH pair for a quote token");
+
+        IV2Pair pair = IV2Pair(pool);
+        (uint112 r0, uint112 r1, ) = pair.getReserves();
+        (uint256 reserveToken, uint256 reserveQuote) = pair.token0() == tokenAddr
+            ? (uint256(r0), uint256(r1))
+            : (uint256(r1), uint256(r0));
+        assertEq(reserveQuote, 1_000 ether - 10 ether, "quote reserve != threshold - fee");
+        assertApproxEqRel(reserveToken, 200_000_000 ether, 0.01e18, "token reserve != ~200M");
+        assertEq(pair.balanceOf(DEAD), pair.totalSupply() - 1000, "LP not entirely burned");
+        assertEq(IERC20(tokenAddr).balanceOf(address(factory)), 0, "tokens trapped in the contract");
+        assertLt(before - usd.balanceOf(buyer), 2_000 ether, "pulled more than what graduates");
+
+        // What the factory still holds in the quote is exactly what it owes
+        assertApproxEqAbs(
+            usd.balanceOf(address(factory)),
+            factory.quoteFeesAccrued(address(usd)) + _creatorFees(id),
+            100,
+            "quote accounting broken"
+        );
+        assertEq(address(factory).balance, 0, "no ETH involved");
     }
 }

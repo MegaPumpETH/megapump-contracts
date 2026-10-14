@@ -89,7 +89,7 @@ contract CriticalScenariosTest is Helpers {
         _sell(id, alice, aliceTokens);
         assertEq(_balanceOf(id, alice), 0, "alice has zero tokens");
 
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
         assertLe(info.tokensSold, 10, "tokensSold near zero");
         assertLe(info.totalRaised, 1e15, "totalRaised drained (residual fees only)");
         assertFalse(info.graduated, "not graduated, just emptied");
@@ -113,7 +113,7 @@ contract CriticalScenariosTest is Helpers {
         _buy(id, bob, 5 ether);
         uint256 bobTokens = _balanceOf(id, bob);
 
-        uint256 expected = factory.estimateSell(id, bobTokens, bob);
+        uint256 expected = lens.estimateSell(id, bobTokens, bob);
 
         vm.prank(bob);
         vm.expectRevert(SlippageExceeded.selector);
@@ -151,7 +151,7 @@ contract CriticalScenariosTest is Helpers {
             + _balanceOf(id, dave)
             + _balanceOf(id, eve);
 
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
         assertEq(info.tokensSold, sumBalances, "tokensSold == sum of holders");
 
         uint256 contractTokens = IERC20(info.tokenAddress).balanceOf(address(factory));
@@ -293,7 +293,8 @@ contract SellReentrancyAttacker {
     }
 
     function attack() external {
-        IERC20 token = IERC20(factory.getTokenInfo(id).tokenAddress);
+        (, , , , , , address tokenAddr, , , , , , , , ) = factory.tokenData(id);
+        IERC20 token = IERC20(tokenAddr);
         uint256 bal = token.balanceOf(address(this));
         factory.sell(id, bal, 0, address(0), "");
     }

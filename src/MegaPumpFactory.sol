@@ -9,6 +9,8 @@ import "./BondingCurveMath.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import "./GraduationLib.sol";
+import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 // ============================================================
 //  ReentrancyGuard (inline — OZ v5 upgradeable no longer ships a separate file)
@@ -74,12 +76,23 @@ error NoPendingTransfer();
 error SignatureExpired();
 error SignatureAlreadyUsed();
 error InvalidSignature();
+error WrongQuote();
+error QuoteNotEnabled();
+error QuoteAmountMismatch();
 
 /// @title  MegaPumpFactory — Memecoin launchpad on MegaETH (UUPS Upgradeable)
 /// @author MegaPump
 /// @notice Free token creation, bonding curve pricing, automatic graduation.
 /// @dev    Storage layout is append-only — never remove or reorder existing variables.
 ///         Add new variables only at the END of the storage section on upgrades.
+///
+/// v3 — multi-quote: a token is quoted in ETH or in an ERC-20 the owner enabled
+/// with setQuote (USDm, MEGA...). The quote is fixed at creation (TokenData.quote,
+/// address(0) = ETH, so every pre-v3 token is ETH) and every amount of the token
+/// is in it: curve, fees, graduation threshold and fee, DEX pool. The ETH
+/// functions keep their ABI; the ERC-20 path has its own (createAndBuyWithQuote,
+/// buyWithQuote, claimReferrerQuoteFees, withdrawQuoteFees). A quote must be a
+/// plain ERC-20: no fee on transfer, no rebase.
 ///
 /// Security highlights:
 /// - ReentrancyGuard on all fund-moving functions (buy, sell, claims, withdraw)
@@ -88,7 +101,9 @@ error InvalidSignature();
 /// - Slippage protection on buy and sell (anti-sandwich / front-running)
 /// - Anti-snipe window on first N blocks after creation
 /// - All prices computed on-chain — no external oracle
+/// - ERC-20 quotes: SafeERC20, and every pull checks the amount actually received
 contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgradeable {
+    using SafeERC20 for IERC20;
 
 
     // ============================================================
@@ -108,6 +123,11 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
     uint256 public constant MAX_GRADUATION_FEE   = 0.1 ether;
     bytes32 public constant CREATE_TYPEHASH = keccak256(
         "CreateToken(address creator,string name,string ticker,string metadataURI,uint256 deadline,uint256 nonce)"
+    );
+    /// @notice v3 — creation of a token quoted in an ERC-20 (USDm, MEGA...).
+    ///         The quote is signed by the creator, so a third party cannot change it.
+    bytes32 public constant CREATE_QUOTE_TYPEHASH = keccak256(
+        "CreateTokenWithQuote(address creator,string name,string ticker,string metadataURI,address quote,uint256 deadline,uint256 nonce)"
     );
 
 
@@ -129,27 +149,19 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         bool    graduated;
         address dexPool;
         uint256 lpTokenId;
-        uint256 graduationETH; // ← locked at creation
+        uint256 graduationETH; // ← locked at creation (in quote units since v3)
+        address quote;         // ← v3: quote asset, address(0) = ETH (all pre-v3 tokens)
     }
 
-    struct TokenInfo {
-        address creator;
-        string  name;
-        string  ticker;
-        string  metadataURI;
-        address tokenAddress;
-        uint256 totalRaised;
-        uint256 tokensSold;
-        uint256 creatorFees;
-        bool    graduated;
-        address dexPool;
-        uint256 createdAt;
-        uint256 currentPrice;
-        uint256 marketCap;
-        uint256 bondingProgress; // basis points (0–10000)
-        bool    deployed;
-        uint256 graduationETH;
+    /// @notice v3 — settings of an ERC-20 quote asset (USDm, MEGA...).
+    ///         ETH keeps its legacy settings (graduationETH, graduationFee).
+    struct QuoteConfig {
+        bool    enabled;          // new tokens may be created in this quote
+        uint256 graduationAmount; // threshold locked into new tokens, in quote units
+        uint256 graduationFee;    // taken at graduation, in quote units
     }
+
+    // TokenInfo moved to MegaPumpLens along with getTokenInfo (same fields, same ABI).
 
     // ============================================================
     //  STORAGE — declaration order is IMMUTABLE across upgrades
@@ -209,6 +221,17 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
     /// @notice Tracks consumed creation signatures — anti-replay
     mapping(bytes32 => bool) public usedSignatures;
 
+    // ── Multi-quote (v3, append-only) ────────────────────────────
+    // Slot 19
+    /// @notice Settings of each ERC-20 quote asset. ETH is not in here.
+    mapping(address => QuoteConfig) public quoteConfig;
+    // Slot 20
+    /// @notice Platform fees accrued per ERC-20 quote (ETH stays in platformFeesAccrued)
+    mapping(address => uint256) public quoteFeesAccrued;
+    // Slot 21
+    /// @notice Referrer fees per referrer and ERC-20 quote (ETH stays in referrerFees)
+    mapping(address => mapping(address => uint256)) public referrerQuoteFees;
+
     // ── Future upgrades: add new variables HERE only ─────────────
 
     // ============================================================
@@ -248,6 +271,13 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
     event SignerUpdated(address indexed oldSigner, address indexed newSigner);
     event TokenCreationCooldownUpdated(uint256 oldCooldown, uint256 newCooldown);
     event OwnershipTransferCancelled(address indexed cancelledOwner);
+    /// @notice v3 — emitted at creation of a token quoted in an ERC-20.
+    ///         A token without this event is quoted in ETH.
+    event TokenQuote(uint256 indexed tokenId, address indexed quote);
+    event QuoteUpdated(address indexed quote, bool enabled, uint256 graduationAmount, uint256 graduationFee);
+    event ReferrerQuoteFeesClaimed(address indexed referrer, address indexed quote, uint256 amount);
+    /// @notice A creator cancelled one of their signed creation intents.
+    event CreationCancelled(address indexed creator, bytes32 indexed digest);
 
     // ============================================================
     //  MODIFIERS
@@ -355,7 +385,9 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
     /// @param _ticker      Token ticker (1-10 chars)
     /// @param _metadataURI ipfs:// URI to the ERC-721-style metadata JSON
     /// @param _deadline    Signature expiry (use type(uint256).max for "no expiry")
-    /// @param _signature   EIP-712 signature by _creator over the above fields
+    /// @param _signature   EIP-712 signature by _creator over the above fields.
+    ///                     Optional when msg.sender == _creator (empty bytes),
+    ///                     consumed whenever passed (anti-replay).
     /// @param _minTokensOut Slippage protection on the first buy
     /// @param _referrer    Optional referrer address (use address(0) for none)
     /// @param _referrerSig Referrer signature from backend (or empty bytes if none)
@@ -373,10 +405,7 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         bytes calldata _referrerSig
     ) external payable nonReentrant notPaused returns (uint256) {
         // ── 1. Validation inputs ──────────────────────────────────
-        if (bytes(_name).length == 0 || bytes(_name).length > 32) revert InvalidName();
-        if (bytes(_ticker).length == 0 || bytes(_ticker).length > 10) revert InvalidTicker();
-        if (msg.value == 0) revert NoETH();
-        if (_creator == address(0)) revert InvalidAddress();
+        _validateCreate(_creator, _name, _ticker, msg.value);
 
         // ── 2. Auth path: either msg.sender == creator OR valid EIP-712 sig ──
         //
@@ -388,14 +417,12 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         // Third parties (anyone paying gas on behalf of the creator) MUST
         // provide a valid EIP-712 signature from the creator. This preserves
         // the gasless flow's security guarantees.
-        if (msg.sender != _creator) {
-            // ── Third-party path: require valid EIP-712 signature ──
-            if (block.timestamp > _deadline) revert SignatureExpired();
-
-            bytes32 sigHash = keccak256(_signature);
-            if (usedSignatures[sigHash]) revert SignatureAlreadyUsed();
-            usedSignatures[sigHash] = true;
-
+        //
+        // A signature passed on the self-create path is not verified, but it
+        // IS consumed (see _consumeCreateSignature): the creator may be
+        // deploying their own pending token, whose signature is public. Left
+        // unconsumed, a third party could replay it and deploy a clone.
+        if (msg.sender != _creator || _signature.length != 0) {
             bytes32 structHash = keccak256(abi.encode(
                 CREATE_TYPEHASH,
                 _creator,
@@ -405,69 +432,230 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
                 _deadline,
                 _nonce
             ));
-            bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
-            address recovered = ECDSA.recover(digest, _signature);
-            if (recovered != _creator) revert InvalidSignature();
+            if (msg.sender != _creator) _checkCreateSignature(_creator, structHash, _deadline, _signature);
+            else _consumeCreateSignature(structHash, _signature);
         }
-        // Else: msg.sender == _creator. Self-create. Tx signature is proof enough.
+        // Else: self-create with no signature. Tx signature is proof enough.
 
-        // ── 3. Cooldown check on the CREATOR (not msg.sender) ────
+        // ── 3-4. Cooldown, then the token slot (quoted in ETH) ────
+        uint256 id = _createToken(_creator, _name, _ticker, _metadataURI, address(0), _signature);
+
+        // ── 5. Execute the first buy ────
+        _executeBuy(id, msg.value, _minTokensOut, _referrer, _referrerSig);
+
+        return id;
+    }
+
+    /// @notice v3 — same as createAndBuyForCreator for a token quoted in an
+    ///         ERC-20 (USDm, MEGA...). The quote is part of the creator's
+    ///         EIP-712 signature (CreateTokenWithQuote). The first buyer must
+    ///         have approved `_amountIn` of the quote to this contract; only
+    ///         the amount actually used is pulled.
+    function createAndBuyWithQuote(
+        address _creator,
+        string calldata _name,
+        string calldata _ticker,
+        string calldata _metadataURI,
+        address _quote,
+        uint256 _deadline,
+        uint256 _nonce,
+        bytes calldata _signature,
+        uint256 _amountIn,
+        uint256 _minTokensOut,
+        address _referrer,
+        bytes calldata _referrerSig
+    ) external nonReentrant notPaused returns (uint256) {
+        _validateCreate(_creator, _name, _ticker, _amountIn);
+        if (!quoteConfig[_quote].enabled) revert QuoteNotEnabled();
+
+        // Same auth rule as createAndBuyForCreator, signature consumed on the
+        // self-create path too.
+        if (msg.sender != _creator || _signature.length != 0) {
+            bytes32 structHash = keccak256(abi.encode(
+                CREATE_QUOTE_TYPEHASH,
+                _creator,
+                keccak256(bytes(_name)),
+                keccak256(bytes(_ticker)),
+                keccak256(bytes(_metadataURI)),
+                _quote,
+                _deadline,
+                _nonce
+            ));
+            if (msg.sender != _creator) _checkCreateSignature(_creator, structHash, _deadline, _signature);
+            else _consumeCreateSignature(structHash, _signature);
+        }
+
+        uint256 id = _createToken(_creator, _name, _ticker, _metadataURI, _quote, _signature);
+        _executeBuy(id, _amountIn, _minTokensOut, _referrer, _referrerSig);
+        return id;
+    }
+
+    /// @dev Input checks shared by both creation paths, in their original order.
+    function _validateCreate(
+        address _creator, string calldata _name, string calldata _ticker, uint256 _amount
+    ) internal pure {
+        if (bytes(_name).length == 0 || bytes(_name).length > 32) revert InvalidName();
+        if (bytes(_ticker).length == 0 || bytes(_ticker).length > 10) revert InvalidTicker();
+        if (_amount == 0) revert NoETH();
+        if (_creator == address(0)) revert InvalidAddress();
+    }
+
+    /// @dev Third-party creation: checks the creator's EIP-712 signature over
+    ///      `_structHash` and consumes it (anti-replay).
+    function _checkCreateSignature(
+        address _creator, bytes32 _structHash, uint256 _deadline, bytes calldata _signature
+    ) internal {
+        if (block.timestamp > _deadline) revert SignatureExpired();
+
+        bytes32 digest = _consumeCreateSignature(_structHash, _signature);
+
+        // Universal verification: ECDSA for EOAs (bit-identical to v1),
+        // ERC-1271 isValidSignature for smart accounts (MOSS, Safe, ...).
+        if (!SignatureChecker.isValidSignatureNow(_creator, digest, _signature)) {
+            revert InvalidSignature();
+        }
+    }
+
+    /// @dev Marks the creation intent `_structHash` as used and returns its
+    ///      EIP-712 digest. Reverts if it was already used.
+    ///      On the self-create path (msg.sender == creator) it is called
+    ///      without verifying the signature: the digest embeds the caller as
+    ///      creator, so the caller can only close their own intents. No
+    ///      deadline check either, the creator's own tx needs none.
+    function _consumeCreateSignature(bytes32 _structHash, bytes calldata _signature)
+        internal returns (bytes32 digest)
+    {
+        digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), _structHash));
+
+        // Replay guard keyed on the DIGEST (the creation intent), not the
+        // signature bytes. ERC-1271 accounts may accept multiple byte-strings
+        // for one digest (multiple session keys, envelope malleability) —
+        // keying on sig bytes would allow replaying the same intent.
+        // The sigHash check preserves pre-upgrade consumed entries (v1 wrote
+        // sigHash keys into this same mapping/slot).
+        bytes32 sigHash = keccak256(_signature);
+        if (usedSignatures[sigHash] || usedSignatures[digest]) revert SignatureAlreadyUsed();
+        usedSignatures[digest] = true;
+    }
+
+    /// @notice Cancels a signed creation intent before anyone deploys it. The
+    ///         signature becomes unusable, for everyone. Pass the exact fields
+    ///         that were signed, with `_quote = address(0)` for an ETH token.
+    /// @dev    Only the creator can cancel: the digest embeds msg.sender as the
+    ///         creator, so any other caller only marks a digest nobody signed.
+    ///         Same replay key as the creation paths (usedSignatures[digest]).
+    ///         Not paused on purpose: withdrawing an intent must always work.
+    function cancelCreation(
+        string calldata _name,
+        string calldata _ticker,
+        string calldata _metadataURI,
+        address _quote,
+        uint256 _deadline,
+        uint256 _nonce
+    ) external {
+        bytes32 structHash = _quote == address(0)
+            ? keccak256(abi.encode(
+                CREATE_TYPEHASH, msg.sender,
+                keccak256(bytes(_name)), keccak256(bytes(_ticker)), keccak256(bytes(_metadataURI)),
+                _deadline, _nonce))
+            : keccak256(abi.encode(
+                CREATE_QUOTE_TYPEHASH, msg.sender,
+                keccak256(bytes(_name)), keccak256(bytes(_ticker)), keccak256(bytes(_metadataURI)),
+                _quote, _deadline, _nonce));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
+        if (usedSignatures[digest]) revert SignatureAlreadyUsed();
+        usedSignatures[digest] = true;
+        emit CreationCancelled(msg.sender, digest);
+    }
+
+    /// @dev Cooldown on the creator, then the token slot and its ERC-20.
+    ///      v3: the ERC-20 is deployed here, straight from calldata, and the
+    ///      name, ticker and metadata URI are no longer copied into tokenData:
+    ///      they live on the token contract and in TokenCreated. Saves three
+    ///      string writes per creation and ~2.5 KB of factory bytecode. The
+    ///      first buy still follows in the same transaction, and the event
+    ///      order is unchanged: TokenCreated, TokenDeployed, then Trade.
+    ///      The graduation threshold is locked from the quote's current setting.
+    function _createToken(
+        address _creator,
+        string calldata _name,
+        string calldata _ticker,
+        string calldata _metadataURI,
+        address _quote,
+        bytes calldata _signature
+    ) internal returns (uint256 id) {
+        // ── Cooldown check on the CREATOR (not msg.sender) ────
         uint256 last = lastTokenCreatedAt[_creator];
         if (last != 0 && block.timestamp - last < tokenCreationCooldown) {
             revert CreationCooldown(tokenCreationCooldown - (block.timestamp - last));
         }
         lastTokenCreatedAt[_creator] = block.timestamp;
 
-        // ── 4. Create the token slot with creator = signer ───────
-        tokenCount++;
-        tokenData[tokenCount] = TokenData({
-            creator: _creator,
-            name: _name,
-            ticker: _ticker,
-            metadataURI: _metadataURI,
-            createdBlock: block.number,
-            createdAt: block.timestamp,
-            tokenAddress: address(0),
-            totalRaised: 0,
-            tokensSold: 0,
-            creatorFees: 0,
-            graduated: false,
-            dexPool: address(0),
-            lpTokenId: 0,
-            graduationETH: graduationETH
-        });
+        // ── Create the token slot with creator = signer ───────
+        // Fresh slot: every field not written here is zero.
+        id = ++tokenCount;
+        TokenData storage d = tokenData[id];
+        d.creator       = _creator;
+        d.createdBlock  = block.number;
+        d.createdAt     = block.timestamp;
+        d.graduationETH = _quote == address(0) ? graduationETH : quoteConfig[_quote].graduationAmount;
+        d.quote         = _quote;
 
         emit TokenCreated(
-            tokenCount, _name, _ticker, _metadataURI,
+            id, _name, _ticker, _metadataURI,
             _creator, keccak256(_signature), block.timestamp
         );
+        if (_quote != address(0)) emit TokenQuote(id, _quote);
 
-        // ── 5. Execute the first buy ────
-        _executeBuy(tokenCount, _minTokensOut, _referrer, _referrerSig);
-
-        return tokenCount;
+        // ── Deploy the ERC-20 (the whole supply is minted to this contract) ──
+        address token = address(new MegaPumpToken(_name, _ticker, _metadataURI, address(this)));
+        d.tokenAddress = token;
+        tokenIdByAddress[token] = id;
+        emit TokenDeployed(id, token, block.timestamp);
     }
 
     // ============================================================
     //  BUY
     // ============================================================
 
+    /// @notice Buys a token quoted in ETH, paid with msg.value.
     /// @param _referrer Referrer address from backend — address(0) if none.
     function buy(uint256 _tokenId, uint256 _minTokensOut, address _referrer, bytes calldata _referrerSig)
         external payable nonReentrant notPaused validToken(_tokenId) notGraduated(_tokenId)
-    { _executeBuy(_tokenId, _minTokensOut, _referrer, _referrerSig); }
+    {
+        if (tokenData[_tokenId].quote != address(0)) revert WrongQuote();
+        _executeBuy(_tokenId, msg.value, _minTokensOut, _referrer, _referrerSig);
+    }
+
+    /// @notice v3 — buys a token quoted in an ERC-20 (USDm, MEGA...).
+    ///         `_amountIn` of the quote must be approved to this contract; only
+    ///         the amount actually used is pulled (less near graduation).
+    function buyWithQuote(
+        uint256 _tokenId,
+        uint256 _amountIn,
+        uint256 _minTokensOut,
+        address _referrer,
+        bytes calldata _referrerSig
+    ) external nonReentrant notPaused validToken(_tokenId) notGraduated(_tokenId) {
+        if (tokenData[_tokenId].quote == address(0)) revert WrongQuote();
+        _executeBuy(_tokenId, _amountIn, _minTokensOut, _referrer, _referrerSig);
+    }
 
 
+    /// @dev `_amountIn` is msg.value for ETH tokens, the approved amount for
+    ///      ERC-20 quoted tokens. All amounts below are in the token's quote.
     function _executeBuy(
         uint256 _tokenId,
+        uint256 _amountIn,
         uint256 _minTokensOut,
         address _referrer,
         bytes calldata _referrerSig
     ) internal {
-        if (msg.value == 0) revert NoETH();
+        if (_amountIn == 0) revert NoETH();
         TokenData storage data = tokenData[_tokenId];
 
-        // Deploy ERC-20 on first buy (deferred deployment)
+        // Legacy: tokens created before v3 deploy their ERC-20 on first buy.
+        // Since v3 the token is deployed at creation (_createToken).
         if (data.tokenAddress == address(0)) _deployToken(_tokenId);
 
         bool isCreatorBuying = (msg.sender == data.creator);
@@ -488,14 +676,14 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         uint256 ethGrossUsed;
         uint256 ethNetForCurve;
         {
-            // Tentative net based on full msg.value
-            uint256 fullFee     = (msg.value * totalFeeBps) / 10000;
-            uint256 fullNet     = msg.value - fullFee;
+            // Tentative net based on the full amount in
+            uint256 fullFee     = (_amountIn * totalFeeBps) / 10000;
+            uint256 fullNet     = _amountIn - fullFee;
             uint256 raisedAfter = data.totalRaised + fullNet;
 
             if (raisedAfter <= data.graduationETH) {
                 // No overflow → consume the full amount
-                ethGrossUsed   = msg.value;
+                ethGrossUsed   = _amountIn;
                 ethNetForCurve = fullNet;
             } else {
                 // Overflow → cap net to exactly graduationETH - totalRaised
@@ -508,10 +696,10 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
                 //       totalRaised may end at graduationETH - 1 wei, still triggers grad.
                 ethGrossUsed = (ethNetForCurve * 10000) / (10000 - totalFeeBps);
 
-                // Edge guard: if rounding made ethGrossUsed > msg.value, cap to msg.value.
+                // Edge guard: if rounding made ethGrossUsed > _amountIn, cap to _amountIn.
                 // Should never happen with sane inputs but defensive.
-                if (ethGrossUsed > msg.value) {
-                    ethGrossUsed   = msg.value;
+                if (ethGrossUsed > _amountIn) {
+                    ethGrossUsed   = _amountIn;
                     // Recompute final net consistently
                     uint256 finalFee = (ethGrossUsed * totalFeeBps) / 10000;
                     ethNetForCurve  = ethGrossUsed - finalFee;
@@ -519,7 +707,7 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
             }
         }
 
-        uint256 ethRefund = msg.value - ethGrossUsed;
+        uint256 ethRefund = _amountIn - ethGrossUsed;
 
         // ════════════════════════════════════════════════════════════════
         //  STEP 2 — Compute tokens out from the actual net used
@@ -555,8 +743,12 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
             // Defensive: setReferrerFeeBps already enforces refFeeBps < platformFeeBps,
             // so refFee < platformFeeFull is guaranteed. Belt-and-suspenders:
             if (refFee >= platformFeeFull) refFee = platformFeeFull > 0 ? platformFeeFull - 1 : 0;
-            referrerFees[effectiveReferrer] += refFee;
+            _creditReferrer(data.quote, effectiveReferrer, refFee);
         }
+
+        // ERC-20 quote: pull exactly what the curve uses, so nothing has to be
+        // refunded. ETH arrived with msg.value; its unused part is refunded below.
+        if (data.quote != address(0)) _pullQuote(data.quote, ethGrossUsed);
 
         // ════════════════════════════════════════════════════════════════
         //  STEP 4 — State updates BEFORE external calls (CEI strict)
@@ -565,7 +757,7 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         data.totalRaised    += ethNetForCurve;
         data.tokensSold     += tokensOut;
         data.creatorFees    += creatorFee;
-        platformFeesAccrued += platformFeeFull - refFee;
+        _creditPlatform(data.quote, platformFeeFull - refFee);
 
         // ════════════════════════════════════════════════════════════════
         //  STEP 5 — External calls: token transfer, then refund, then grad
@@ -575,7 +767,7 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
 
         IERC20(data.tokenAddress).transfer(msg.sender, tokensOut);
 
-        if (ethRefund > 0) {
+        if (ethRefund > 0 && data.quote == address(0)) {
             (bool refunded, ) = payable(msg.sender).call{value: ethRefund}("");
             if (!refunded) revert ETHTransferFailed();
         }
@@ -671,7 +863,7 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         address effectiveReferrer = _sanitizeReferrer(_referrer, _referrerSig);
         if (effectiveReferrer != address(0)) {
             refFee = (ethOut * referrerFeeBps) / 10000;
-            referrerFees[effectiveReferrer] += refFee;
+            _creditReferrer(data.quote, effectiveReferrer, refFee);
         }
 
         // Compute real creator fee (0 if creator selling)
@@ -681,11 +873,10 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         data.totalRaised    -= ethOut;
         data.tokensSold     -= _tokenAmount;
         data.creatorFees    += creatorFee;
-        platformFeesAccrued += grossPlatformFee - refFee;
+        _creditPlatform(data.quote, grossPlatformFee - refFee);
 
         IERC20(data.tokenAddress).transferFrom(msg.sender, address(this), _tokenAmount);
-        (bool sent, ) = payable(msg.sender).call{value: ethToSeller}("");
-        if (!sent) revert ETHTransferFailed();
+        _send(data.quote, msg.sender, ethToSeller);
 
         // Trade event reflects ACTUAL fees accrued
         _emitTrade(
@@ -703,6 +894,10 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
 
     /// @dev Rejects: address(0) and self-referral.
     ///      Backend controls which address is passed as referrer.
+    ///      C-04: a malformed signature (wrong length, high-s, unrecoverable)
+    ///      no longer reverts the whole trade — the referrer is simply
+    ///      ignored, like an unsigned one. `tryRecoverCalldata` returns
+    ///      address(0) on error, which can never equal a non-zero trustedSigner.
     function _sanitizeReferrer(
     address _referrer,
     bytes calldata _sig
@@ -714,7 +909,7 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         // Hash includes msg.sender — signature can't be reused by another trader
         bytes32 hash = keccak256(abi.encodePacked(_referrer, msg.sender));
         bytes32 ethHash = MessageHashUtils.toEthSignedMessageHash(hash);
-        address recovered = ECDSA.recover(ethHash, _sig);
+        (address recovered, , ) = ECDSA.tryRecoverCalldata(ethHash, _sig);
 
         if (recovered != trustedSigner) return address(0);
         return _referrer;
@@ -730,6 +925,48 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         emit ReferrerFeesClaimed(msg.sender, amount);
     }
 
+    /// @notice v3 — claims referrer fees accrued in an ERC-20 quote.
+    function claimReferrerQuoteFees(address _quote) external nonReentrant {
+        uint256 amount = referrerQuoteFees[msg.sender][_quote];
+        if (amount == 0) revert NoReferrerFees();
+        referrerQuoteFees[msg.sender][_quote] = 0;
+        _send(_quote, msg.sender, amount);
+        emit ReferrerQuoteFeesClaimed(msg.sender, _quote, amount);
+    }
+
+    // ============================================================
+    //  QUOTE HELPERS (v3) — address(0) is ETH, anything else an ERC-20
+    // ============================================================
+
+    function _creditPlatform(address _quote, uint256 _amount) internal {
+        if (_quote == address(0)) platformFeesAccrued += _amount;
+        else quoteFeesAccrued[_quote] += _amount;
+    }
+
+    function _creditReferrer(address _quote, address _referrer, uint256 _amount) internal {
+        if (_quote == address(0)) referrerFees[_referrer] += _amount;
+        else referrerQuoteFees[_referrer][_quote] += _amount;
+    }
+
+    /// @dev Pulls `_amount` of an ERC-20 quote from msg.sender and checks the
+    ///      contract really received it: a fee-on-transfer or otherwise
+    ///      non-standard quote would break the accounting, so it reverts.
+    function _pullQuote(address _quote, uint256 _amount) internal {
+        uint256 before = IERC20(_quote).balanceOf(address(this));
+        IERC20(_quote).safeTransferFrom(msg.sender, address(this), _amount);
+        if (IERC20(_quote).balanceOf(address(this)) - before != _amount) revert QuoteAmountMismatch();
+    }
+
+    /// @dev Pays `_amount` of the quote (ETH or ERC-20) to `_to`.
+    function _send(address _quote, address _to, uint256 _amount) internal {
+        if (_quote == address(0)) {
+            (bool sent, ) = payable(_to).call{value: _amount}("");
+            if (!sent) revert ETHTransferFailed();
+        } else {
+            IERC20(_quote).safeTransfer(_to, _amount);
+        }
+    }
+
     // ============================================================
     //  GRADUATION
     // ============================================================
@@ -742,11 +979,17 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
     ///      5. Burns any remaining tokens held by the factory
     function _graduate(uint256 _tokenId) internal {
         TokenData storage data = tokenData[_tokenId];
-        if (data.totalRaised <= graduationFee) revert BelowMinimum();
+        address quote = data.quote;
+        uint256 fee   = quote == address(0) ? graduationFee : quoteConfig[quote].graduationFee;
+        // A quote's fee could be raised after a token locked a lower threshold:
+        // cap it so a later config change can never block a graduation. For ETH
+        // this never binds (fee <= 0.1 ETH, threshold >= 5 ETH).
+        if (fee > data.totalRaised / 10) fee = data.totalRaised / 10;
+        if (data.totalRaised <= fee) revert BelowMinimum();
         data.graduated = true;
 
-        uint256 ethForDex    = data.totalRaised - graduationFee;
-        platformFeesAccrued += graduationFee;
+        uint256 ethForDex = data.totalRaised - fee;
+        _creditPlatform(quote, fee);
 
         uint256 tokensForDex = IERC20(data.tokenAddress).balanceOf(address(this));
 
@@ -754,7 +997,8 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
             GraduationLib.GradParams({
                 tokenAddress: data.tokenAddress,
                 weth:         weth,
-                router:       router,    
+                quote:        quote,
+                router:       router,
                 ethForDex:    ethForDex,
                 tokensForDex: tokensForDex
             })
@@ -785,13 +1029,14 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         uint256 amount = data.creatorFees;
         if (amount == 0) revert NoFees();
         data.creatorFees = 0;
-        (bool sent, ) = payable(msg.sender).call{value: amount}("");
-        if (!sent) revert ETHTransferFailed();
+        _send(data.quote, msg.sender, amount);
         emit CreatorFeesClaimed(_tokenId, msg.sender, amount);
     }
 
     /// @notice Claims creator fees across multiple tokens in one transaction.
     /// @dev    Skips tokens where caller is not creator or fees are zero.
+    ///         v3: one batch pays in one quote. The first claimable token sets
+    ///         it; tokens in another quote are skipped (claim them separately).
     ///         Max 100 tokens per call to cap gas usage.
     function claimAllCreatorFees(uint256[] calldata _tokenIds) external nonReentrant {
         if (_tokenIds.length == 0) revert EmptyBatch();
@@ -799,6 +1044,7 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
 
         uint256 totalAmount = 0;
         uint256 claimed     = 0;
+        address batchQuote;
 
         for (uint256 i = 0; i < _tokenIds.length; i++) {
             uint256 tokenId = _tokenIds[i];
@@ -806,6 +1052,8 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
             TokenData storage data = tokenData[tokenId];
             if (data.creator != msg.sender) continue;
             if (data.creatorFees == 0) continue;
+            if (claimed == 0) batchQuote = data.quote;
+            else if (data.quote != batchQuote) continue;
 
             uint256 amount = data.creatorFees;
             data.creatorFees = 0;
@@ -817,8 +1065,7 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
 
         if (totalAmount == 0) revert NoFees();
 
-        (bool sent, ) = payable(msg.sender).call{value: totalAmount}("");
-        if (!sent) revert ETHTransferFailed();
+        _send(batchQuote, msg.sender, totalAmount);
 
         emit CreatorFeesClaimedAll(msg.sender, totalAmount, claimed);
     }
@@ -835,138 +1082,10 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         return id;
     }
 
-    /// @notice Estimates tokens received for a given ETH buy amount.
-    /// @param _trader Address that will execute the buy. Pass `address(0)`
-    ///                to use default fees (non-creator). For accurate
-    ///                estimates, pass the actual buyer address.
-    function estimateBuy(uint256 _tokenId, uint256 _ethAmount, address _trader)
-        external view validToken(_tokenId) returns (uint256)
-    {
-        bool isCreator = _trader == tokenData[_tokenId].creator;
-        uint256 feeBps = platformFeeBps + (isCreator ? 0 : creatorFeeBps);
-        uint256 ethAfterFees = _ethAmount - (_ethAmount * feeBps) / 10000;
-        return BondingCurveMath.getTokensForETH(
-            tokenData[_tokenId].tokensSold,
-            ethAfterFees,
-            tokenData[_tokenId].graduationETH
-        );
-    }
-
-    /// @notice Estimates ETH received for a given token sell amount.
-    function estimateSell(uint256 _tokenId, uint256 _tokenAmount, address _trader)
-        external view validToken(_tokenId) returns (uint256)
-    {
-        bool isCreator = _trader == tokenData[_tokenId].creator;
-        uint256 feeBps = platformFeeBps + (isCreator ? 0 : creatorFeeBps);
-        uint256 ethBefore = BondingCurveMath.getETHForTokens(
-            tokenData[_tokenId].tokensSold,
-            _tokenAmount,
-            tokenData[_tokenId].graduationETH
-        );
-        return ethBefore - (ethBefore * feeBps) / 10000;
-    }
-
-    /// @notice ETH to send (fees included) to receive at least `tokensWanted`.
-    function estimateBuyReverse(uint256 _tokenId, uint256 _tokensWanted, address _trader)
-        external view validToken(_tokenId) returns (uint256)
-    {
-        uint256 ethNet = BondingCurveMath.getETHForExactTokens(
-            tokenData[_tokenId].tokensSold,
-            _tokensWanted,
-            tokenData[_tokenId].graduationETH
-        );
-        bool isCreator = _trader == tokenData[_tokenId].creator;
-        uint256 feeBps = platformFeeBps + (isCreator ? 0 : creatorFeeBps);
-        return (ethNet * 10000 + (10000 - feeBps) - 1) / (10000 - feeBps);
-    }
-
-    /// @notice Tokens to sell to receive at least `ethWanted` after fees.
-    function estimateSellReverse(uint256 _tokenId, uint256 _ethWanted, address _trader)
-        external view validToken(_tokenId) returns (uint256)
-    {
-        bool isCreator = _trader == tokenData[_tokenId].creator;
-        uint256 feeBps = platformFeeBps + (isCreator ? 0 : creatorFeeBps);
-        uint256 ethGross = (_ethWanted * 10000 + (10000 - feeBps) - 1) / (10000 - feeBps);
-        return BondingCurveMath.getTokensForExactETH(
-            tokenData[_tokenId].tokensSold,
-            ethGross,
-            tokenData[_tokenId].graduationETH
-        );
-    }
-
-
-    // ════════════════════════════════════════════════════════════════
-    //  FIRST-BUY ESTIMATES (PENDING tokens — no on-chain state yet)
-    //
-    //  Used by the frontend to estimate the first buy of a PENDING token.
-    //  PENDING tokens have no on-chain state (totalRaised=0, tokensSold=0),
-    //  which makes the math deterministic and independent of any tokenId.
-    //
-    //  Sell estimates are intentionally omitted: a PENDING token has no
-    //  minted supply, so no one can hold tokens to sell.
-    //
-    //  The _isCreator flag is required because the contract has no tokenId
-    //  to look up the creator from — the frontend must indicate explicitly
-    //  whether the caller is the future creator (no creator fee) or a
-    //  third-party first-buyer (full fees).
-    // ════════════════════════════════════════════════════════════════
-
-    /// @notice Tokens received for a first buy of `_ethAmount` on any PENDING
-    ///         token. Mirrors the `estimateBuy` API for tokens that don't
-    ///         exist on-chain yet.
-    function estimateFirstBuy(uint256 _ethAmount, bool _isCreator)
-        external view returns (uint256)
-    {
-        if (_ethAmount == 0) return 0;
-        uint256 feeBps = platformFeeBps + (_isCreator ? 0 : creatorFeeBps);
-
-        // Cap ethAfterFees defensively to graduationETH. Mirrors the overflow
-        // path of _executeBuy for the first-buy case where totalRaised=0.
-        // This guarantees we never feed an absurd input into the curve math.
-        uint256 ethAfterFees = _ethAmount - (_ethAmount * feeBps) / 10000;
-        if (ethAfterFees > graduationETH) ethAfterFees = graduationETH;
-
-        return BondingCurveMath.getTokensForETH(0, ethAfterFees, graduationETH);
-    }
-
-    /// @notice ETH to send (fees included) to receive at least `_tokensWanted`
-    ///         on a first buy. Mirrors `estimateBuyReverse`.
-    function estimateFirstBuyReverse(uint256 _tokensWanted, bool _isCreator)
-        external view returns (uint256)
-    {
-        if (_tokensWanted == 0) return 0;
-        uint256 ethNet = BondingCurveMath.getETHForExactTokens(
-            0,                  // tokensSold = 0 for PENDING
-            _tokensWanted,
-            graduationETH
-        );
-        uint256 feeBps = platformFeeBps + (_isCreator ? 0 : creatorFeeBps);
-        return (ethNet * 10000 + (10000 - feeBps) - 1) / (10000 - feeBps);
-}
-
-    /// @notice Returns a full snapshot of a token's on-chain state.
-    function getTokenInfo(uint256 _tokenId) external view validToken(_tokenId)
-        returns (TokenInfo memory info)
-    {
-        TokenData storage d = tokenData[_tokenId];
-        info.creator         = d.creator;
-        info.name            = d.name;
-        info.ticker          = d.ticker;
-        info.metadataURI     = d.metadataURI;
-        info.tokenAddress    = d.tokenAddress;
-        info.totalRaised     = d.totalRaised;
-        info.tokensSold      = d.tokensSold;
-        info.creatorFees     = d.creatorFees;
-        info.graduated       = d.graduated;
-        info.dexPool         = d.dexPool;
-        info.createdAt       = d.createdAt;
-        info.currentPrice    = BondingCurveMath.getCurrentPrice(d.tokensSold, d.graduationETH);
-        info.marketCap       = BondingCurveMath.getMarketCap(d.tokensSold, d.graduationETH);
-        info.bondingProgress = d.graduated ? 10000 : (d.totalRaised * 10000) / d.graduationETH;
-        info.deployed        = d.tokenAddress != address(0);
-        info.graduationETH   = d.graduationETH;
-    }
-
+    // Estimates (estimateBuy, estimateSell, estimateBuyReverse,
+    // estimateSellReverse, estimateFirstBuy, estimateFirstBuyReverse) and
+    // getTokenInfo now live in MegaPumpLens: same signatures, same results,
+    // read from this proxy's public getters. Moved out to free bytecode.
 
     // ============================================================
     //  ADMIN
@@ -979,6 +1098,28 @@ contract MegaPumpFactory is Initializable, UUPSUpgradeable, ReentrancyGuardUpgra
         platformFeesAccrued = 0;
         (bool sent, ) = payable(owner).call{value: amount}("");
         if (!sent) revert ETHTransferFailed();
+    }
+
+    /// @notice v3 — withdraws platform fees accrued in an ERC-20 quote.
+    function withdrawQuoteFees(address _quote) external nonReentrant onlyOwner {
+        uint256 amount = quoteFeesAccrued[_quote];
+        if (amount == 0) revert NoFees();
+        quoteFeesAccrued[_quote] = 0;
+        _send(_quote, owner, amount);
+    }
+
+    /// @notice v3 — adds, updates or disables an ERC-20 quote asset.
+    /// @dev    Disabling only blocks new tokens: existing ones keep trading and
+    ///         graduating with the fee set here. Each token locks the threshold
+    ///         at creation. The fee is capped at 10% of the threshold.
+    function setQuote(address _quote, bool _enabled, uint256 _graduationAmount, uint256 _graduationFee)
+        external onlyOwner
+    {
+        if (_quote == address(0) || _quote == weth) revert InvalidAddress();
+        if (_graduationAmount == 0) revert BelowMinimum();
+        if (_graduationFee * 10 > _graduationAmount) revert ExceedsMaxFee();
+        quoteConfig[_quote] = QuoteConfig(_enabled, _graduationAmount, _graduationFee);
+        emit QuoteUpdated(_quote, _enabled, _graduationAmount, _graduationFee);
     }
 
     function setPaused(bool _p) external onlyOwner { paused = _p; }

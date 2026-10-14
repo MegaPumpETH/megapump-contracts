@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 error ZeroAmount();
 
@@ -14,6 +15,17 @@ interface IUniswapV2Router {
         address to,
         uint256 deadline
     ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity);
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);
 
     function factory() external view returns (address);
 }
@@ -32,30 +44,42 @@ library GraduationLib {
 
     struct GradParams {
         address tokenAddress;
-        address weth;          
-        address router;       
-        uint256 ethForDex;
+        address weth;
+        address quote;         // v3: address(0) = ETH (pair with WETH), else the ERC-20 quote
+        address router;
+        uint256 ethForDex;     // quote amount for the pool (ETH or ERC-20 units)
         uint256 tokensForDex;
     }
 
 
+    /// @dev External (v3): deployed once and linked, called by DELEGATECALL, so
+    ///      it runs in the factory's context but its code sits outside the
+    ///      factory's EIP-170 budget.
     function executeGraduation(GradParams memory p)
-        internal returns (address pool, uint256 liquidity)
+        external returns (address pool, uint256 liquidity)
     {
         if (p.ethForDex == 0 || p.tokensForDex == 0) revert ZeroAmount();
 
+        address pairWith = p.quote == address(0) ? p.weth : p.quote;
         address factory = IUniswapV2Router(p.router).factory();
-        pool = IUniswapV2Factory(factory).getPair(p.tokenAddress, p.weth);
+        pool = IUniswapV2Factory(factory).getPair(p.tokenAddress, pairWith);
         if (pool == address(0)) {
-            pool = IUniswapV2Factory(factory).createPair(p.tokenAddress, p.weth);
+            pool = IUniswapV2Factory(factory).createPair(p.tokenAddress, pairWith);
         }
 
         IUniswapV2Pair(pool).skim(DEAD);
 
         IERC20(p.tokenAddress).approve(p.router, p.tokensForDex);
 
-        ( , , liquidity) = IUniswapV2Router(p.router).addLiquidityETH{value: p.ethForDex}(
-            p.tokenAddress, p.tokensForDex, 0, 0, DEAD, block.timestamp
-        );
+        if (p.quote == address(0)) {
+            ( , , liquidity) = IUniswapV2Router(p.router).addLiquidityETH{value: p.ethForDex}(
+                p.tokenAddress, p.tokensForDex, 0, 0, DEAD, block.timestamp
+            );
+        } else {
+            SafeERC20.forceApprove(IERC20(p.quote), p.router, p.ethForDex);
+            ( , , liquidity) = IUniswapV2Router(p.router).addLiquidity(
+                p.tokenAddress, p.quote, p.tokensForDex, p.ethForDex, 0, 0, DEAD, block.timestamp
+            );
+        }
     }
 }

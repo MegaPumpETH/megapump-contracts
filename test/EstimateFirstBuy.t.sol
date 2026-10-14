@@ -20,13 +20,13 @@ contract EstimateFirstBuyTest is Helpers {
     // ════════════════════════════════════════════════════════════
 
     function test_EstimateFirstBuy_ZeroEth_ReturnsZero() public {
-        assertEq(factory.estimateFirstBuy(0, false), 0, "zero in -> zero out (3rd party)");
-        assertEq(factory.estimateFirstBuy(0, true),  0, "zero in -> zero out (creator)");
+        assertEq(lens.estimateFirstBuy(0, false), 0, "zero in -> zero out (3rd party)");
+        assertEq(lens.estimateFirstBuy(0, true),  0, "zero in -> zero out (creator)");
     }
 
     function test_EstimateFirstBuy_NonCreator_AppliesFullFees() public view {
         uint256 ethIn = 0.1 ether;
-        uint256 tokensOut = factory.estimateFirstBuy(ethIn, false);
+        uint256 tokensOut = lens.estimateFirstBuy(ethIn, false);
 
         uint256 totalFeeBps  = factory.platformFeeBps() + factory.creatorFeeBps();
         uint256 ethAfterFees = ethIn - (ethIn * totalFeeBps) / 10000;
@@ -41,7 +41,7 @@ contract EstimateFirstBuyTest is Helpers {
 
     function test_EstimateFirstBuy_Creator_NoCreatorFee() public view {
         uint256 ethIn = 0.1 ether;
-        uint256 tokensOut = factory.estimateFirstBuy(ethIn, true);
+        uint256 tokensOut = lens.estimateFirstBuy(ethIn, true);
 
         // Creator pays only platform fee (no creator fee on their own buy)
         uint256 feeBps       = factory.platformFeeBps();
@@ -57,8 +57,8 @@ contract EstimateFirstBuyTest is Helpers {
 
     function test_EstimateFirstBuy_CreatorGetsMoreThanThirdParty() public view {
         uint256 ethIn = 0.1 ether;
-        uint256 asCreator    = factory.estimateFirstBuy(ethIn, true);
-        uint256 asThirdParty = factory.estimateFirstBuy(ethIn, false);
+        uint256 asCreator    = lens.estimateFirstBuy(ethIn, true);
+        uint256 asThirdParty = lens.estimateFirstBuy(ethIn, false);
 
         assertGt(asCreator, asThirdParty, "creator pays less fees -> receives more tokens");
     }
@@ -68,7 +68,7 @@ contract EstimateFirstBuyTest is Helpers {
         // The function MUST cap ethAfterFees to graduationETH to avoid
         // returning absurd values from the curve math.
         uint256 hugeEthIn = 100 ether;
-        uint256 tokensOut = factory.estimateFirstBuy(hugeEthIn, false);
+        uint256 tokensOut = lens.estimateFirstBuy(hugeEthIn, false);
 
         // Expected = curve at zero state with ethAfterFees capped to graduationETH
         uint256 expected = BondingCurveMath.getTokensForETH(
@@ -91,7 +91,7 @@ contract EstimateFirstBuyTest is Helpers {
         uint256 ethIn = 0.05 ether;
 
         // Estimate first (alice IS the creator -> isCreator=true)
-        uint256 estimated = factory.estimateFirstBuy(ethIn, true);
+        uint256 estimated = lens.estimateFirstBuy(ethIn, true);
 
         // Execute the first buy via createAndBuyForCreator
         bytes memory sig = _signCreateFor(
@@ -115,7 +115,7 @@ contract EstimateFirstBuyTest is Helpers {
         uint256 ethIn = 0.05 ether;
 
         // Estimate first (bob is third party, NOT the creator -> isCreator=false)
-        uint256 estimated = factory.estimateFirstBuy(ethIn, false);
+        uint256 estimated = lens.estimateFirstBuy(ethIn, false);
 
         // Bob executes the first buy on behalf of alice (creator)
         // Alice signs the create authorization
@@ -143,8 +143,8 @@ contract EstimateFirstBuyTest is Helpers {
     // ════════════════════════════════════════════════════════════
 
     function test_EstimateFirstBuyReverse_ZeroTokens_ReturnsZero() public {
-        assertEq(factory.estimateFirstBuyReverse(0, false), 0);
-        assertEq(factory.estimateFirstBuyReverse(0, true),  0);
+        assertEq(lens.estimateFirstBuyReverse(0, false), 0);
+        assertEq(lens.estimateFirstBuyReverse(0, true),  0);
     }
 
     function test_EstimateFirstBuyReverse_RoundTrip_NonCreator() public view {
@@ -152,24 +152,24 @@ contract EstimateFirstBuyTest is Helpers {
         // Reverse rounds UP (ceil) so the forward call should yield at least
         // tokensWanted — never less.
         uint256 tokensWanted = 1_000_000 ether;
-        uint256 ethNeeded     = factory.estimateFirstBuyReverse(tokensWanted, false);
-        uint256 tokensReceived = factory.estimateFirstBuy(ethNeeded, false);
+        uint256 ethNeeded     = lens.estimateFirstBuyReverse(tokensWanted, false);
+        uint256 tokensReceived = lens.estimateFirstBuy(ethNeeded, false);
 
         assertGe(tokensReceived, tokensWanted, "reverse must round up (3rd party)");
     }
 
     function test_EstimateFirstBuyReverse_RoundTrip_Creator() public view {
         uint256 tokensWanted = 1_000_000 ether;
-        uint256 ethNeeded     = factory.estimateFirstBuyReverse(tokensWanted, true);
-        uint256 tokensReceived = factory.estimateFirstBuy(ethNeeded, true);
+        uint256 ethNeeded     = lens.estimateFirstBuyReverse(tokensWanted, true);
+        uint256 tokensReceived = lens.estimateFirstBuy(ethNeeded, true);
 
         assertGe(tokensReceived, tokensWanted, "reverse must round up (creator)");
     }
 
     function test_EstimateFirstBuyReverse_CreatorNeedsLessETH() public view {
         uint256 tokensWanted = 1_000_000 ether;
-        uint256 asCreator    = factory.estimateFirstBuyReverse(tokensWanted, true);
-        uint256 asThirdParty = factory.estimateFirstBuyReverse(tokensWanted, false);
+        uint256 asCreator    = lens.estimateFirstBuyReverse(tokensWanted, true);
+        uint256 asThirdParty = lens.estimateFirstBuyReverse(tokensWanted, false);
 
         assertLt(asCreator, asThirdParty, "creator pays less ETH for same tokens");
     }
@@ -178,7 +178,7 @@ contract EstimateFirstBuyTest is Helpers {
         // Use reverse to figure out how much ETH alice needs for ~1M tokens,
         // then actually buy and verify she receives at least 1M tokens.
         uint256 tokensWanted = 1_000_000 ether;
-        uint256 ethNeeded    = factory.estimateFirstBuyReverse(tokensWanted, true);
+        uint256 ethNeeded    = lens.estimateFirstBuyReverse(tokensWanted, true);
 
         bytes memory sig = _signCreateFor(
             alice, "RevTest", "REV", "ipfs://test", type(uint256).max, 0

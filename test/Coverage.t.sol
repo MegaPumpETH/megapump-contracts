@@ -138,7 +138,7 @@ contract CoverageTest is Helpers {
         factory.buy{value: 30 ether}(id, 0, address(0), "");
         assertTrue(_info(id).graduated);
 
-        MegaPumpFactory.TokenInfo memory info = _info(id);
+        MegaPumpLens.TokenInfo memory info = _info(id);
         assertEq(info.bondingProgress, 10000, "bondingProgress maxed post-grad");
         assertTrue(info.graduated);
         assertTrue(info.dexPool != address(0), "dexPool set");
